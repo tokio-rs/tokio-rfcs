@@ -70,10 +70,10 @@ extern crate tokio_io;
 use std::env;
 use std::net::SocketAddr;
 
-use futures::Future;
-use futures::stream::Stream;
+use futures::{Stream, Future};
 use futures::unsync::CurrentThread;
 use tokio::net::TcpListener;
+use tokio::reactor::Handle;
 use tokio_io::AsyncRead;
 use tokio_io::io::copy;
 
@@ -83,7 +83,8 @@ fn main() {
 
     // Notice that unlike today, no `handle` argument is needed when creating a
     // `TcpListener`.
-    let socket = TcpListener::bind(&addr).unwrap();
+    let handle = Handle::global();
+    let socket = TcpListener::bind(&addr, handle).unwrap();
     println!("Listening on: {}", addr);
 
     let done = socket.incoming().for_each(move |(socket, addr)| {
@@ -134,27 +135,29 @@ no longer exposed, and this will need to be constructed manually if desired.
 The new `tokio` crate will have a similar API to `tokio-core`, but with a few
 notable differences:
 
-* All APIs that take `&Handle` today will have this argument removed. For
-  example `Timeout::new(dur)` instead of `Timeout::new(dur, &handle)`.
-* The `Remote` and `Handle` types are removed
-* `Core` is now both `Send` and `Sync`
-* Public methods on `Core` take `&self` instead of `&mut self`.
+* `Core` is now both `Send` and `Sync`, but methods continue to take `&mut self`
+  for `poll` and `turn` to ensure exclusive access when running a `Core`. This
+  restriction may also be lifted in the future.
+* The `Handle` type is now also both `Send` and `Sync`. This removes the need
+  for `Remote`. The `Handle` type also has a `global` method to acquire a
+  handle to the global event loop.
+* All spawning related functionality is removed in favor of implementations in
+  the `futures` crate.
 
-The removal of the `&Handle` arguments are made possible through the event loop
-management detailed below. The removal of `Handle` and `Remote` is made possible
-through two separate avenues:
+The removal of the distinction between `Handle` and `Remote` is made possible
+through removing the ability to spawn. This means that a `Core` itself is
+fundamentally `Send`-compatible and with a tweak to the implementation we can
+get both `Core` and `Handle` to be both `Send` and `Sync`.
 
-* First and foremost, the ability to `spawn` futures onto a `Core` has been
-  removed. This is discussed more in the spawning futures section below.
-* Next, the `Core` type itself is now `Send` and `Sync`, namely allowing for
-  concurrent registration of I/O objects and timeouts.
+All methods will continue to take `&Handle` but it's not required to create a
+`Core` to acquire a `Handle`. Instead the `Handle::global` function can be used
+to extract a handle to the global even tloop.
 
 The remaining APIs of `Core` are the `run` and `turn` methods. Although `Core`
 is `Send` and `Sync` it's not intended to rationalize the behavior of concurrent
-usage of `Core::run` just yet. Instead both of these methods are explicitly
-documented as "this doesn't make sense to call concurrently". It's expected that
-in the future we'll rationalize a story for concurrently calling these methods,
-but that's left to a future RFC.
+usage of `Core::run` just yet. Instead both of these methods continue to take
+`&mut self`. It's expected that in the future we'll rationalize a story for
+concurrently calling these methods, but that's left to a future RFC.
 
 ## Event loop management
 
@@ -164,56 +167,26 @@ initialized global event loop will be executed on a helper thread for each
 process. Applications can continue, if necessary, to create and run a `Core`
 manually to avoid usage of the helper thread and its `Core`.
 
-All threads will have a "default `Core`" associated with them. When a thread
-starts this default `Core` is the global `Core`. There will be a few APIs within
-the `reactor` module to modify this, however:
+
+Code that currently looks like this will continue to work:
 
 ```rust
-impl Core {
-    /// Acquire a reference to this thread's current core.
-    ///
-    /// This function may return different values when called over time, but the
-    /// core returned here is the core that all I/O objects and timeouts will be
-    /// associated with on construction.
-    ///
-    /// # Errors
-    ///
-    /// If this function falls back to creating the global `Core` it may return
-    /// an error, which is indicated through the return value.
-    pub fn current() -> io::Result<Core>;
-
-    /// Acquire a reference to the global default `Core`.
-    ///
-    /// This function will acquire a reference to the global `Core` which is
-    /// being executed on a helper thread in the application. The core returned
-    /// here is the same each time this function is called.
-    ///
-    /// # Errors
-    ///
-    /// If this function initializes the global `Core` it may return
-    /// an error, which is indicated through the return value.
-    pub fn global() -> io::Result<Core>;
-
-    /// Flags this core as the "current core" for all future operations.
-    ///
-    /// Calling this function affects the return value of `Core::current`. The
-    /// most recent call to `push_current` in this thread is what will be
-    /// returned from `Core::current`. When the `PushCurrent` struct here falls
-    /// out of scope then the previous current core will be restored.
-    pub fn push_current<'a>(&'a self) -> PushCurrent<'a>;
-}
+let mut core = Core::new().unwrap();
+let handle = core.handle();
+let listener = TcpListener::bind(&addr, &handle).unwrap();
+let server = listener.incoming().for_each(/* ... */);
+core.run(server).unwrap();
 ```
 
-The purpose of these APIs is to:
+although examples and documentation will instead recommend a pattern that looks
+like:
 
-* Allow the ability to customize what `Core` I/O objects are registered with.
-  Custom-created cores can use `push_current` to ensure that they're used for
-  I/O and timeout registration.
-* If desired, I/O objects and timeouts can be explicitly registered with the
-  global core instead of the currently listed core.
-
-The current core will be managed through a TLS variable, and the global core
-will be managed internally by the `tokio` crate.
+```rust
+let handle = Handle::global();
+let listener = TcpListener::bind(&addr, handle).unwrap();
+let server = listener.incoming().for_each(/* ... */);
+server.wait().unwrap();
+```
 
 ## Spawning Futures
 
@@ -315,27 +288,14 @@ Crates with `tokio-core` as a public dependency will be able to upgrade to
   enough to not require a `TcpStream` specifically.
 * Similarly if a `UdpSocket` is exposed it's intended that `Sink` and `Stream`
   can likely be used instead.
-* If `Handle` is exposed then backwards compatibility can be retained by:
-  * Deprecate the method taking a `Handle`
-  * Add a new method which *doesn't* take a handle with a "worse name". For
-    example `UnixListener::bind` would become `UnixListener::bind2`.
-  * The previous method can be implemented in terms of the new method via the
-    ability to acquire a `Core` from a `Handle` and then usage of
-    `push_current`.
+* If `Handle` is exposed then backwards compatibility can be retained by
+  converting the argument to a generic value. A trait, `AsHandle`, will be added
+  to the `tokio` crate for ease of performing this transition. Both the old
+  `tokio-core` `Handle` and the new `Handle` will implement this trait.
 
 Our hope is that crates which have a major version bump themselves on the
-horizon can take advantage of the opportunity to "switch" the apis here to have
-the "good name" not take a `Handle` and `tokio-core` support can be dropped.
-
-An example of the migration path for `Handle` looks like:
-
-* Today there's a `UnixListener::bind(&Path, &Handle)` API
-* After `tokio` is published a `UnixListener::bind2(&Path)` API will be added
-* The `UnixListener::bind` API is deprecated
-* The `UnixListener::bind` API is implemented by calling `bind2`
-* When the `UnixListener` crate has a major version bump the `bind2` API is
-  removed, the `bind` function removes the `Handle` argument, and the
-  `tokio-core` dependency is dropped.
+horizon can take advantage of the opportunity to remove the trait bound and
+simply take a `tokio` `Handle` argument.
 
 # Drawbacks
 [drawbacks]: #drawbacks
@@ -358,35 +318,7 @@ As with any API design there's a lot of various alternatives to consider, but
 for now this'll be limited to more focused alternatives to the current "general
 design" rather than more radical alternatives that may look entirely different.
 
-### TLS `Core` vs handles
-
-Right now the "current core" is managed through thread-local state via the
-`current`, `global`, and `push_current` APIs. An alternative, however, is to
-have two versions of all APIs: one that doesn't take a handle and one that does.
-For example:
-
-```rust
-impl TcpStream {
-    pub fn connect(addr: &SocketAddr) -> TcpStreamNew;
-    pub fn connect_core(addr: &SocketAddr, core: &Core) -> TcpStreamNew;
-}
-```
-
-This would allow us to remove the `current`, `global`, and `push_default` APIs
-on `Core` as you could then explicitly configure what `Core` an I/O object is
-registered with via `*_core` methods. The benefit of this approach is that you
-can no longer accidentally spawn work onto the default core instead of the
-global core. The thinking is that the non-`Handle` methods are always "this is
-global" and the `*_core` methods are "this is a specific core".
-
-The downside of this approach, however, is that the API surface area duplication
-is required in all consumers of the `tokio` crate. For example not just
-`TcpStream` would be required to have two methods but anything internally
-creating a `TcpStream` would require two methods. Furthermore the downside of
-this approach is that you may spawn work onto the global core when you intended
-the local core. If a library you're using *doesn't* have the duplicate API
-surface area yet, you're forced to use it on the global core if you'd otherwise
-have a local core.
+TODO: more docs here
 
 # Unresolved questions
 [unresolved]: #unresolved-questions
