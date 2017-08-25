@@ -1,9 +1,18 @@
 # Summary
 [summary]: #summary
 
-Simplify the Tokio project by renaming the `tokio-core` crate to `tokio`,
-greatly reducing ergonomic issues in the existing `tokio-core` API, and
-de-emphasize `tokio-proto` and `tokio-service` in the online documentation.
+Drastically simplify the Tokio project by addressing some of the major pain
+points of using its apis today:
+
+* Remove the distinction between `Handle` and `Remote` in `tokio-core` by making
+  `Handle` both `Send` and `Sync`.
+* Add a global event loop in `tokio-core` that is managed automatically, along
+  with the ability to acquire a global `Handle` reference.
+* Focus documentation on `tokio-core` rather than `tokio-proto`, and delegate
+  the functionality of `tokio-proto` to upstream projects rather than under the
+  umbrella 'Tokio' moniker.
+
+
 
 # Motivation
 [motivation]: #motivation
@@ -20,10 +29,11 @@ documentation. The `tokio-proto` crate itself is only intended to be used by
 authors implementing protocols, which is in theory a pretty small number of
 people! Instead though the implementation and workings of `tokio-proto` threw
 many newcomers for a spin as they struggled to understand how `tokio-proto`
-solved their problem. It's our intention that with this RFC the `tokio-proto`
-and `tokio-service` crates are effectively deprecated. This will provide a
-strong signal that users and newcomers should be entering at a different point
-of the stack.
+solved their problem. It's our intention that with this RFC the functionality
+provided by the `tokio-proto` and `tokio-service` crates are effectively
+moved elsewhere in the ecosystem. In other words, the "Tokio project" as a term
+should not invoke thoughts of `tokio-proto` or `tokio-service` as they are
+today, but be more solely focused around `tokio-core`.
 
 Anecdotally we've had more success with the `tokio-core` crate being easier to
 pick up and not as complicated, but it's not without its own problems. The
@@ -34,33 +44,26 @@ tasks and managing I/O. Our hope is to rearchitect the `tokio-core` crate with a
 drastically simpler API surface area to make introductory examples easier to
 read and libraries using `tokio-core` easier to write.
 
-Finally one of the main points of confusion around the Tokio project has been
-around the many layers that are available to you. Each crate under the Tokio
-umbrella provides a slightly different entry point and is intended for different
-audiences, but it's often difficult to understand what audience you're supposed
-to be in! This in turn has led us to the conclusion that we'd like to rename the
-`tokio-core` crate under the new name `tokio`. This crate, `tokio`, will be the
-heart soul of the Tokio project, deferring frameworks like the functionality
-`tokio-proto` and `tokio-service` provide to different libraries and projects.
-
 It is our intention that after this reorganization happens the introduction to
 the Tokio project is a much more direct and smoother path than it is today.
-There will be fewer crates to consider (just `tokio`) which have a much smaller
-API to work with (detailed below) and should allow us to tackle the heart of
-async programming, futures, much more quickly in the documentation.
+There will be fewer crates to consider (mostly just `tokio-core`) which have a
+much smaller API to work with (detailed below) and should allow us to tackle
+the heart of async programming, futures, much more quickly in the
+documentation.
 
 # Guide-level explanation
 [guide-level-explanation]: #guide-level-explanation
 
 The Tokio project, intended to be the foundation of the asynchronous I/O
-ecosystem in Rust, is defined by its main crate, `tokio`. The `tokio` crate will
-provide an implementation of an event loop, powered by the cross-platform `mio`
-library. The main feature of `tokio` is to enable using I/O objects to implement
-futures, such as TCP connections, UDP sockets, etc.
+ecosystem in Rust, is defined by its main crate, `tokio-core`. The `tokio-core`
+crate will provide an implementation of an event loop, powered by the
+cross-platform `mio` library. The main feature of `tokio-core` is to enable
+using I/O objects to implement futures, such as TCP connections, UDP sockets,
+etc.
 
-The `tokio` crate by default has a global event loop that all I/O will be
+The `tokio-core` crate by default has a global event loop that all I/O will be
 processed on. The global event loop enables std-like servers to be created, for
-example this would be an echo server written with `tokio`:
+example this would be an echo server written with `tokio-core`:
 
 ```rust
 extern crate futures;
@@ -81,10 +84,9 @@ fn main() {
     let addr = env::args().nth(1).unwrap_or("127.0.0.1:8080".to_string());
     let addr = addr.parse::<SocketAddr>().unwrap();
 
-    // Notice that unlike today, no `handle` argument is needed when creating a
-    // `TcpListener`.
-    let handle = Handle::global();
-    let socket = TcpListener::bind(&addr, handle).unwrap();
+    // Notice that unlike today, the `handle` argument is acquired as a global
+    // reference rather than from a locally defined `Core`.
+    let socket = TcpListener::bind(&addr, Handle::global()).unwrap();
     println!("Listening on: {}", addr);
 
     let done = socket.incoming().for_each(move |(socket, addr)| {
@@ -115,6 +117,11 @@ worry about what an event loop is or how to interact with it. Instead most
 servers "will just work" as I/O objects, timeouts, etc, all get bound to the
 global event loop.
 
+Additionally, unlike today, we won't need to mention `Core` in the documentation
+at all. Instead we can recommend beginners to simply use `Handle::global()` to
+acquire a reference to a handle, and this architecture may even be the most
+appropriate for their use case!
+
 ### Spawning in `futures`
 
 The `futures` crate will grow a type named `CurrentThread` which is an
@@ -125,15 +132,18 @@ tasks. For example while calling `wait` all futures will continue to make
 progress.
 
 One important change with this is that the ability to "spawn onto a `Core`" is
-no longer exposed, and this will need to be constructed manually if desired.
+no longer exposed, and this will need to be constructed manually if desired. For
+example usage of `Handle::spawn` today will switch to `CurrentThread.spawn`, and
+usage of `Remote::spawn` will need to be manually orchestrated with a
+constructed mpsc channel which uses `CurrentThread.spawn` on one end.
 
 # Reference-level explanation
 [reference-level-explanation]: #reference-level-explanation
 
-## The `tokio` crate API
+## Changes to `tokio-core`
 
-The new `tokio` crate will have a similar API to `tokio-core`, but with a few
-notable differences:
+This RFC is a backwards-compatible change to `tokio-core` and will be released
+as simply a new minor version. The major differences, however will be:
 
 * `Core` is now both `Send` and `Sync`, but methods continue to take `&mut self`
   for `poll` and `turn` to ensure exclusive access when running a `Core`. This
@@ -151,21 +161,25 @@ get both `Core` and `Handle` to be both `Send` and `Sync`.
 
 All methods will continue to take `&Handle` but it's not required to create a
 `Core` to acquire a `Handle`. Instead the `Handle::global` function can be used
-to extract a handle to the global even tloop.
+to extract a handle to the global event loop.
 
-The remaining APIs of `Core` are the `run` and `turn` methods. Although `Core`
-is `Send` and `Sync` it's not intended to rationalize the behavior of concurrent
-usage of `Core::run` just yet. Instead both of these methods continue to take
-`&mut self`. It's expected that in the future we'll rationalize a story for
-concurrently calling these methods, but that's left to a future RFC.
+The deprecated APIs will be:
 
-## Event loop management
+* `Remote` and all related APIs are deprecated
+* `Handle::spawn` is deprecated and reimplemented through `CurrentThread.spawn`
+* `Remote::spawn` is deprecated by sending a future to the reactor and using
+  `CurrentThread.spawn`, but it's intended that applications should orchestrate
+  this themselves rather than using `Remote::spawn`
+* The `Executor` implementations on `Core`, `Handle`, and `Remote` are all
+  deprecated.
+
+## Global event loop
 
 It is intended that all application architectures using `tokio-core` today will
-continue to be possible with `tokio` tomorrow. By default, however, a lazily
-initialized global event loop will be executed on a helper thread for each
-process. Applications can continue, if necessary, to create and run a `Core`
-manually to avoid usage of the helper thread and its `Core`.
+continue to be possible with `tokio-core` after this RFC. By default, however,
+a lazily initialized global event loop will be executed on a helper thread for
+each process. Applications can continue, if necessary, to create and run a
+`Core` manually to avoid usage `Handle::global`.
 
 
 Code that currently looks like this will continue to work:
@@ -262,48 +276,40 @@ characteristics as the current implementation in `tokio-core`.
 
 ## Fate of other Tokio crates
 
-This RFC proposed deprecating the `tokio-core`, `tokio-proto`, and
-`tokio-service` crates. The `tokio-proto` and `tokio-service` crates will be
-deprecated without replacement for now, but it's expected that higher level
-application frameworks will quickly fill in the gap here. For example most users
-already aren't using `tokio-proto` (it's just an implementation detail of
-`hyper`). Crates like `hyper`'s exposure of `tokio-service` will be refactored
-in an application-specific manner, likely involving a Hyper-specific trait.
+This RFC proposed deprecating the `tokio-proto` and `tokio-service` crates
+*within the Tokio project*. It's intended that the purpose of these crates will
+be taken over by higher level projects rather than continuing to be equated with
+the "Tokio" project and moniker. The documentation of the Tokio project will
+reflect this by getting updated to exclusively discuss `tokio-core` and the
+abstractions that it provides.
 
-The `tokio-core` crate, however, will be deprecated with the `tokio` crate as a
-replacement. The migration path should be relatively straightforward,
-essentially deleting all `Core`, `Remote`, and `Handle` usage while taking
-advantage of `CurrentThread`. The `tokio-core` crate will be *reimplemented*,
-however, in terms of the new `tokio` crate. A new API will be added to extract a
-`tokio::reactor::Core` from a `tokio_core::reactor::Handle`. That is, you can
-acquire non-deprecated structures from deprecated structures.
+The `tokio-service` and `tokio-proto` crates will not be immediately deprecated,
+but they will likely be deprecated once a replacement arises within the
+ecosystem. The documentation, again, will make far fewer mentions of these
+crates relative to `futures` in general and the `tokio-core` crate.
 
-## API migration guidelines
+## Migration Guide
 
-Crates with `tokio-core` as a public dependency will be able to upgrade to
-`tokio` without an API breaking change. The migration path looks like:
+As mentioned before, this RFC is a backwards-compatible change to the
+`tokio-core` crate. The new deprecations, however, can be migrated via:
 
-* If `TcpStream` is exposed in a public API, the API should be generalizable to
-  an instance of `AsyncRead + AsyncWrite`. The traits here should in theory be
-  enough to not require a `TcpStream` specifically.
-* Similarly if a `UdpSocket` is exposed it's intended that `Sink` and `Stream`
-  can likely be used instead.
-* If `Handle` is exposed then backwards compatibility can be retained by
-  converting the argument to a generic value. A trait, `AsHandle`, will be added
-  to the `tokio` crate for ease of performing this transition. Both the old
-  `tokio-core` `Handle` and the new `Handle` will implement this trait.
+* Usage of `Remote` can be switched to usage of `Handle`.
+* Usage of `Core` can largely get removed in favor of `Handle::global`.
+* Usage of `Handle::spawn` or `Executor for Core` can be replaced with the
+  `CurrentThread` type in the `futures` crate.
+* Usage of `Remote::spawn` must be rearchitected locally with a manually created
+  mpsc channel and `CurrentThread`.
 
-Our hope is that crates which have a major version bump themselves on the
-horizon can take advantage of the opportunity to remove the trait bound and
-simply take a `tokio` `Handle` argument.
+APIs will otherwise continue to take `&Handle` as they do today! Further
+non-backwards-compatible fixes to the `tokio-core` crate are deferred for now in
+favor of a future RFC.
 
 # Drawbacks
 [drawbacks]: #drawbacks
 
-This change is inevitably going to create a fairly large amount of churn. The
-migration from `tokio-core` to `tokio` will take time, and furthermore the
-deprecation of `tokio-proto` and `tokio-service` will take some time to
-propagate throughout the ecosystem.
+This change is inevitably going to create a fairly large amount of churn with
+respect to the `tokio-proto` and `tokio-service` crates, and this will take
+some time to propagate throughout the ecosystem.
 
 Despite this, however, we view the churn as worth the benefits we'll reap on the
 other end. This change will empower us to greatly focus the documentation of
