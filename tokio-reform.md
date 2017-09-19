@@ -50,7 +50,7 @@ async" in Rust.
 
 On the documentation side, one mistake we made early on in the Tokio project was
 to so prominently discuss the `tokio-proto` crate in the documentation. While
-the crate was intended to make it very easy to get basic protocol
+the crate was intended to make it very easy to get basic request/response protocol
 implementations up and running, it did not provide a very useful *entry* point
 for learning Tokio as a whole. Moreover, it turns out that there's a much wider
 audience for Tokio than there is for `tokio-proto` in particular. It's not
@@ -249,12 +249,13 @@ use std::io;
 use std::env;
 use std::net::SocketAddr;
 
-use futures::{Future, Stream, IntoFuture, CurrentThread};
+use futures::{Future, Stream, IntoFuture};
+use futures::current_thread::{self, Spawner};
 use tokio_core::net::TcpListener;
 use tokio_io::AsyncRead;
 use tokio_io::io::copy;
 
-fn serve(addr: SocketAddr) -> impl Future<Item = (), Error = io::Error> {
+fn serve(spawner: &Spawner, addr: SocketAddr) -> impl Future<Item = (), Error = io::Error> {
     TcpListener::bind(&addr)
         .into_future()
         .and_then(move |socket| {
@@ -264,7 +265,7 @@ fn serve(addr: SocketAddr) -> impl Future<Item = (), Error = io::Error> {
                 .incoming()
                 .for_each(move |(conn, _)| {
                     let (reader, writer) = conn.split();
-                    CurrentThread.spawn(copy(reader, writer).then(move |result| {
+                    spawner.spawn(copy(reader, writer).then(move |result| {
                         match result {
                             Ok((amt, _, _)) => println!("wrote {} bytes to {}", amt, addr),
                             Err(e) => println!("error on {}: {}", addr, e),
@@ -283,13 +284,15 @@ fn main() {
         .parse()
         .unwrap();
 
-    CurrentThread::run(serve(addr)).unwrap();
+    current_thread::block_on_all(|spawner| {
+        spawner.spawn(serve(spawner, addr));
+    });
 }
 ```
 
 This version of the code retains the move to using futures explicitly, but
 eliminates the explicit event loop setup and handle passing. To execute and
-spawn tasks, it uses the `CurrentThread` executor from futures, which
+spawn tasks, it uses the `current_thread` executor from futures, which
 multiplexes tasks onto the current OS thread. A similar API is available for
 working with the default thread pool instead, which is more appropriate for
 tasks performing blocking or CPU-heavy work.
@@ -311,12 +314,13 @@ use std::env;
 use std::net::SocketAddr;
 
 use futures::prelude::*;
+use futures::current_thread::{self, Spawner};
 use tokio::net::TcpListener;
 use tokio_io::AsyncRead;
 use tokio_io::io::copy;
 
 #[async]
-fn serve(addr: SocketAddr) -> io::Result<()> {
+fn serve(spawner: &Spawner, addr: SocketAddr) -> io::Result<()> {
     let socket = TcpListener::bind(&addr)?;
     println!("Listening on: {}", addr);
 
@@ -325,7 +329,7 @@ fn serve(addr: SocketAddr) -> io::Result<()> {
         // with Tokio, read and write components are distinct:
         let (reader, writer) = conn.split();
 
-        CurrentThread.spawn(async_block! {
+        spawner.spawn(async_block! {
             match await!(copy(reader, writer)) {
                 Ok((amt, _, _)) => println!("wrote {} bytes to {}", amt, addr),
                 Err(e) => println!("error on {}: {}", addr, e),
@@ -345,7 +349,9 @@ fn main() {
         .parse()
         .unwrap();
 
-    CurrentThread::run(serve(addr)).unwrap();
+    current_thread::block_on_all(|spawner| {
+        spawner.spawn(serve(spawner, addr));
+    });
 }
 ```
 
@@ -541,7 +547,6 @@ The reactor module provides just a few types for working with reactors (aka
 event loops):
 
 - `Reactor`, an owned reactor. (Used to be `Core`)
-- `ReactorId`, a unique identifier per reactor instance.
 - `Handle`, a shared, cloneable handle to a reactor.
 - `PollEvented`, a bridge between `mio` event sources and a reactor
 
@@ -551,24 +556,25 @@ Compared to `Core` today, the `Reactor` API is much the same, but drops the
 ```rust
 impl Reactor {
     fn new() -> Result<Reactor>;
-    fn id(&self) -> ReactorId;
     fn handle(&self) -> Handle;
 
-    // blocks until an event (or timeout), then dispatches all pending events
-    fn turn(&mut self, max_wait: Option<Duration>);
+    // blocks, turning the event loop and polling the given future until
+    // either that future completes, or the given timeout expires.
+    fn turn_until<F: Future>(&mut self, max_wait: Option<Duration>, f: &mut F)
+        -> Option<Result<F::Item, F::Error>>
 }
 ```
 
 The `Handle` API is even more slimmed down:
 
 ```rust
-impl Handle {
-    // get a handle to the default global event loop
-    fn global() -> Handle;
-
-    fn id(&self) -> ReactorId;
+impl Default for Handle {
+    // get a handle to the default global event loop ...
 }
 ```
+
+Most usage of the `Handle` type comes through *parameters* to various I/O object
+construction functions, as we'll see in a moment.
 
 Unlike today, though, `Handle` is `Send` and `Sync` (as well as `Clone`).
 Handles are used solely to tie particular I/O objects to particular event loops.
@@ -585,9 +591,9 @@ which play a very similar role.
 
 The `net` module remains almost exactly as it is in `tokio-core` today, with one
 key difference: APIs for constructing I/O objects come in two flavors, one that
-uses the default global reactor, and one that takes an explicit handle. For the
-latter, when there are already multiple configuration options, this RFC proposes
-switching to a builder.
+uses the default global reactor, and one that takes an explicit
+handle. Generally the convenient, "default" mode of construction doesn't take a
+handle, and those involving customizations do.
 
 #### Example: `TcpListener`
 
@@ -596,15 +602,12 @@ impl TcpListener {
     // set up a listener with the global event loop
     fn bind(addr: &SocketAddr) -> io::Result<TcpListener>;
 
-    fn builder(addr: &SocketAddr) -> TcpListenerBuilder;
-}
+    // set up a fully-customized listener
+    fn from_listener(listener: std::net::TcpListener, handle: &Handle) -> io::Result<TcpListener>;
 
-struct TcpListenerBuilder { .. }
-
-impl TcpListenerBuilder {
-    fn handle(&mut self, handle: Handle) -> &mut Self;
-    fn bind(&self) -> io::Result<TcpListener>;
-    fn from_listener(&self, listener: std::net::TcpListener) -> io::Result<TcpListener>;
+    // this now yields a *std* TcpStream, so that you can use `TcpStream::from_stream` to
+    // associate it with an handle of your choice.
+    fn accept(&mut self) -> Result<(std::net::TcpStream, SocketAddr)>
 }
 ```
 
@@ -615,17 +618,9 @@ impl TcpStream {
     // set up a stream with the global event loop
     fn connect(addr: &SocketAddr) -> TcpStreamNew;
 
-    fn builder() -> TcpStreamBuilder;
-}
-
-struct TcpStreamBuilder { .. }
-
-impl TcpStreamBuilder {
-    fn handle(&mut self, handle: Handle) -> &mut Self;
-    fn stream(&mut self, stream: std::net::TcpStream) -> &mut Self;
-
-    fn connect(&self, addr: &SocketAddr) -> TcpStreamNew;
-    fn from_stream(&self) -> TcpStreamNew;
+    // these are as today
+    fn from_stream(stream: TcpStream, handle: &Handle) -> Result<TcpStream>;
+    fn connect_stream(stream: TcpStream, addr: &SocketAddr, handle: &Handle) -> TcpStreamNew
 }
 ```
 
@@ -633,28 +628,34 @@ impl TcpStreamBuilder {
 
 The `timer` module will contain the `Timeout` and `Interval` types currently in
 `tokio_core`'s `reactor` module. Their APIs will be adjusted along similar lines
-as the `net` APIs, except that they will *only* support a builder-style API:
+as the `net` APIs, except that they will *only* support a handle-free mode,
+which *always* uses the default global reactor. (In general, we need control
+over the way the event loop is run in order to support timers.)
 
 ```rust
 impl Timeout {
-    fn build() -> TimeoutBuilder;
+    fn new(dur: Duration) -> Result<Timeout>
+    fn new_at(at: Instant) -> Result<Timeout>
     fn reset(&mut self, at: Instant);
 }
 
-impl TimeoutBuilder {
-    fn handle(&mut self, handle: Handle) -> &mut Self;
+impl Future for Timeout { .. }
 
-    fn at(&mut self, time: Instant) -> Timeout;
-    fn after(&mut self, dur: Duration) -> Timeout;
+impl Interval {
+    fn new(dur: Duration) -> Result<Interval>
+    fn new_at(at: Instant, dur: Duration) -> Result<Interval>
+    fn reset(&mut self, at: Instant);
 }
+
+impl Stream for Interval { .. }
 ```
 
 ### The `io` module
 
-Finally, there may *eventually* be an `io` modulewith the full contents of the
-`tokio-io` crate. However, those APIs need a round of scrutiny first (the
-subject of a future RFC), and they may ultimately be moved into the `futures`
-crate instead.
+Finally, there may *eventually* be an `io` module with the some portion of
+contents of the `tokio-io` crate. However, those APIs need a round of scrutiny
+first (the subject of a future RFC), and they may ultimately be moved into the
+`futures` crate instead.
 
 An eventual goal, in any case, is that you can put Tokio to good use by bringing
 in only the `tokio` and `futures` crates.
@@ -691,6 +692,10 @@ pub mod current_thread {
     // NB: no 'static requirement on the future
     pub fn block_until<F: Future>(f: F) -> Result<F::Item, F::Error>;
 
+    // A convenience function that creates a new task runner, invokes the given
+    // closure with a handle to it, then executes all spawned tasks to completion.
+    pub fn block_on_all<F>(f: F) where F: FnOnce(&Spawner);
+
     // An object for cooperatively executing multiple tasks on a single thread.
     // Useful for working with non-`Send` futures.
     //
@@ -705,7 +710,7 @@ pub mod current_thread {
         pub fn spawner(&self) -> Spawner;
 
         // Blocks, running all *non-daemon* tasks to completion.
-        pub fn block_on_all(&mut self);
+        pub fn block_on_all(&self);
 
         // Blocks, pushing all tasks forward but returning when the given future
         // completes.
@@ -721,6 +726,13 @@ pub mod current_thread {
         // panics if:
         //   (1) not already panicking and
         //   (2) there are non-daemon tasks remaining
+    }
+
+    impl Futue for TaskRunner {
+        type Item = ();
+        type Error = ();
+
+        // polls *all* current tasks
     }
 
     // NB: this is not `Send`
@@ -787,8 +799,9 @@ pub mod executor {
 }
 ```
 
-This API should be used in functions like `block_until` that enter
-executors. Consequently, nested uses of `TaskRunner`, or usage of
+This API should be used in functions like `block_until` that enter executors,
+i.e. that block until some future completes (or other event
+occurs). Consequently, nested uses of `TaskRunner`, or usage of
 `current_thread::block_until` within a `TaskRunner` or thread pool, will panic,
 alerting the user to a bug.
 
@@ -875,6 +888,18 @@ could build a solid http2 implementation with it; this has not panned out so
 far, though it's possible that the crate could be improved to do so.  On the
 other hand, it's not clear that it's useful to provide that level of
 expressiveness in a general-purpose framework.
+
+It seems like there are three basic paths forward:
+
+- Improve `tokio-proto` such that is can support the full `h2`
+  implementation. It's not clear to what extent doing so would benefit *other*
+  protocols, however.
+- Refocus `tokio-proto` on simpler use-cases and ergonomics, e.g. by removing
+  streaming bodies entirely.
+- Deprecate it, in favor of direct, custom server implementations.
+
+It's also not clear what the long-term story for Hyper is; it currently uses
+`tokio-proto`, but may end up using `h2` instead.
 
 So, in general: the future direction for `tokio-proto` is unclear. We need to be
 driven by strong, concrete use-cases. If you have one of these, we'd love to
