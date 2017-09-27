@@ -378,7 +378,7 @@ The *long-term* goal is to provide a complete async story that feels very close 
 synchronous programming, i.e. something like:
 
 ```rust
-async fn serve(addr: SocketAddr) -> io::Result<()> {
+async fn serve(spawner: &Spawner,addr: SocketAddr) -> io::Result<()> {
     let socket = TcpListener::bind(&addr)?;
     println!("Listening on: {}", addr);
 
@@ -386,7 +386,7 @@ async fn serve(addr: SocketAddr) -> io::Result<()> {
         // with Tokio, read and write components are distinct:
         let (reader, writer) = conn.split();
 
-        CurrentThread.spawn(async {
+        spawner.spawn(async {
             match await copy(reader, writer) {
                 Ok((amt, _, _)) => println!("wrote {} bytes to {}", amt, addr),
                 Err(e) => println!("error on {}: {}", addr, e),
@@ -566,29 +566,25 @@ impl Reactor {
     fn new() -> Result<Reactor>;
     fn handle(&self) -> Handle;
 
-    // blocks, turning the event loop until either notified by a future,
+    // blocks, turning the event loop until either woken through a handle,
     // or the given timeout expires.
     fn turn(&mut self, max_wait: Option<Duration>) -> Turn;
 }
 
+// No contents/API initially, but we may want to expand this in the future
 struct Turn { /* ... */ }
-
-impl Turn {
-    // says whether the wakeup was due to a future (and gives the
-    // notification ID if so), or due to a timeout.
-    fn last_notify_id(&self) -> Option<usize>;
-}
 ```
 
-The `turn` API is intended to be used in conjunction with the futures executors
-API if you wish to have futures notify the event loop (because you are polling
-them on the same thread).
-
-The `Handle` API is even more slimmed down:
+The `Handle` API is also slimmed down:
 
 ```rust
 impl Default for Handle {
     // get a handle to the default global event loop ...
+}
+
+impl Handle {
+    // wakes up the corresponding reactor if it is blocking
+    fn wakeup(&self);
 }
 ```
 
@@ -641,6 +637,10 @@ impl<'a> SetDefault<'a> {
             _marker: marker::PhantomData,
         }
     }
+
+    // Keeps this new default handle installed for the duration of the thread's
+    // execution.
+    fn make_permanent(self);
 }
 
 impl<'a> Drop for SetDefault<'a> {
@@ -717,9 +717,9 @@ cooperatively onto their thread of origin, and is *currently* provided by the
 this RFC completely decouples this functionality, moving it instead into the
 `futures` crate.
 
-### The `current_thread` module
+### The `thread` module
 
-The `futures` crate will add a module, `current_thread`, with the following
+The `futures` crate will add a module, `thread`, with the following
 contents:
 
 ```rust
