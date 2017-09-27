@@ -560,16 +560,29 @@ Compared to `Core` today, the `Reactor` API is much the same, but drops the
 `run` and `remote` methods and the `Executor` implementation:
 
 ```rust
+impl<'a> From<&'a Reactor> for NotifyHandle { /* ... */ }
+
 impl Reactor {
     fn new() -> Result<Reactor>;
     fn handle(&self) -> Handle;
 
-    // blocks, turning the event loop and polling the given future until
-    // either that future completes, or the given timeout expires.
-    fn turn_until<F: Future>(&mut self, max_wait: Option<Duration>, f: &mut F)
-        -> Option<Result<F::Item, F::Error>>
+    // blocks, turning the event loop until either notified by a future,
+    // or the given timeout expires.
+    fn turn(&mut self, max_wait: Option<Duration>) -> Turn;
+}
+
+struct Turn { /* ... */ }
+
+impl Turn {
+    // says whether the wakeup was due to a future (and gives the
+    // notification ID if so), or due to a timeout.
+    fn last_notify_id(&self) -> Option<usize>;
 }
 ```
+
+The `turn` API is intended to be used in conjunction with the futures executors
+API if you wish to have futures notify the event loop (because you are polling
+them on the same thread).
 
 The `Handle` API is even more slimmed down:
 
