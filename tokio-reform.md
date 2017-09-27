@@ -20,7 +20,8 @@ it easier to learn and more productive to use. Specifically:
   * When running tasks thread-locally (for non-`Send` futures),
     provide more fool-proof APIs that help avoid lost wakeups.
 
-  * Eventually provide some default thread pools as well (out of scope for this RFC).
+  * Eventually provide some default thread pools as well (out of scope for this
+    RFC).
 
 * Similarly, decouple timer futures from Tokio, providing functionality instead
   through a new `futures-timer` crate.
