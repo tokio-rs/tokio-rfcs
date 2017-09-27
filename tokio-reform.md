@@ -4,21 +4,26 @@
 This RFC proposes to simplify and focus the Tokio project, in an attempt to make
 it easier to learn and more productive to use. Specifically:
 
-* Add a global event loop in `tokio-core` that is managed automatically by
-  default. This change eliminates the need for setting up and managing your own
-  event loop in the vast majority of cases.
+* Add a *default* global event loop, eliminating the need for setting up and
+  managing your own event loop in the vast majority of cases.
 
-  * Moreover, remove the distinction between `Handle` and `Remote` in
-  `tokio-core` by making `Handle` both `Send` and `Sync` and deprecating
-  `Remote`. Thus, even working with custom event loops becomes simpler.
+  * Moreover, remove the distinction between `Handle` and `Remote` by making
+  `Handle` both `Send` and `Sync` and deprecating `Remote`. Thus, even working
+  with custom event loops becomes simpler.
+
+  * Allow swapping out this default event loop for those who want to exercise
+    full control.
 
 * Decouple all task execution functionality from Tokio, instead providing it
-  through a standard futures component. As with event loops, provide a default
-  global thread pool that suffices for the majority of use-cases, removing the
-  need for any manual setup.
+  through a standard futures component.
 
-  * Moreover, when running tasks thread-locally (for non-`Send` futures),
+  * When running tasks thread-locally (for non-`Send` futures),
     provide more fool-proof APIs that help avoid lost wakeups.
+
+  * Eventually provide some default thread pools as well (out of scope for this RFC).
+
+* Similarly, decouple timer futures from Tokio, providing functionality instead
+  through a new `futures-timer` crate.
 
 * Provide the above changes in a new `tokio` crate, which is a slimmed down
   version of today's `tokio-core`, and may *eventually* re-export the contents
@@ -532,11 +537,10 @@ To begin with, the new `tokio` crate will look like a streamlined version of
 `tokio-core`. Eventually it will also re-export APIs from `tokio-io`, once those
 APIs have been fully vetted.
 
-At the top level, the crate will provide four submodules:
+At the top level, the crate will provide three submodules:
 
 - `reactor`: for manual configuration and control over event loops.
 - `net`: I/O objects for async networking.
-- `timer`: APIs for async timers.
 - `io`: general utilities for async I/O (much like `std::io`)
 
 Let's look at each in turn.
@@ -549,6 +553,7 @@ event loops):
 - `Reactor`, an owned reactor. (Used to be `Core`)
 - `Handle`, a shared, cloneable handle to a reactor.
 - `PollEvented`, a bridge between `mio` event sources and a reactor
+- `SetDefault`, an RAII object for overriding the default reactor.
 
 Compared to `Core` today, the `Reactor` API is much the same, but drops the
 `run` and `remote` methods and the `Executor` implementation:
@@ -581,11 +586,55 @@ Handles are used solely to tie particular I/O objects to particular event loops.
 In particular, the `PollEvented` API stays exactly as-is, and is the primitive
 way that I/O objects are registered onto a reactor.
 
-In the future, we expect to provide ways to configure reactors, and to override
-the default reactor within a scope. These APIs will be modeled after
-Rayon's
-[configuration APIs](https://docs.rs/rayon/0.8.2/rayon/struct.Configuration.html),
-which play a very similar role.
+Finally, we have an API for customizing the default reactor handle:
+
+```rust
+struct SetDefault<'a> {
+    handle: &'a Handle,
+    _marker: marker::PhantomData<Rc<()>>, // no sharing to other threads
+}
+
+impl<'a> SetDefault<'a> {
+    // Changes the return value of `Handle::default()` to return a
+    // clone of the `handle` provided.
+    //
+    // This function is used to change the default global event loop
+    // as identified through `Handle::default()`. The new default applies to
+    // the *current OS thread* only; as long as the returned object is live,
+    // the thread will return a clone of the given `Handle` on calls to
+    // `Handle::default()`. This, in particular, prevents the `Handle::default()`
+    // from spinning up a lazily-initialized thread.
+    //
+    // When the returned object goes out of scope then the return value of
+    // `Handle::default()` will revert to the (lazily-initialized) default
+    // event loop.
+    //
+    // This function is intended to be used within *applications* at executor
+    // granularity; it is not intended as a general-purpose mechanism to eschew
+    // passing a `Handle` for library APIs. This function can only be called
+    // *once* recursively on a thread: reentrant uses will panic.
+    //
+    // # Panics
+    //
+    // This function will panic if there's another `SetDefault` object already
+    // active for this thread. In other words, calling this function a second
+    // time on one thread where the first return value is alive will cause a panic.
+    pub fn new(handle: &'a Handle) -> SetDefault<'a> {
+        // panic if tls is `Some`
+        // set scoped tls to `Some(handle)`
+        SetDefault {
+            handle
+            _marker: marker::PhantomData,
+        }
+    }
+}
+
+impl<'a> Drop for SetDefault<'a> {
+    fn drop(&mut self) {
+        // set scoped tls to `None`
+    }
+}
+```
 
 ### The `net` module
 
@@ -624,32 +673,6 @@ impl TcpStream {
 }
 ```
 
-### The `timer` module
-
-The `timer` module will contain the `Timeout` and `Interval` types currently in
-`tokio_core`'s `reactor` module. Their APIs will be adjusted along similar lines
-as the `net` APIs, except that they will *only* support a handle-free mode,
-which *always* uses the default global reactor. (In general, we need control
-over the way the event loop is run in order to support timers.)
-
-```rust
-impl Timeout {
-    fn new(dur: Duration) -> Result<Timeout>
-    fn new_at(at: Instant) -> Result<Timeout>
-    fn reset(&mut self, at: Instant);
-}
-
-impl Future for Timeout { .. }
-
-impl Interval {
-    fn new(dur: Duration) -> Result<Interval>
-    fn new_at(at: Instant, dur: Duration) -> Result<Interval>
-    fn reset(&mut self, at: Instant);
-}
-
-impl Stream for Interval { .. }
-```
-
 ### The `io` module
 
 Finally, there may *eventually* be an `io` module with the some portion of
@@ -666,10 +689,11 @@ In general, futures are spawned onto *executors*, which are responsible for
 polling them to completion. There are basically two ways this can work: either
 you run a future on your thread, or someone else's (i.e. a thread pool).
 
-The threadpool case is provided by crates like [futures_cpupool], but the intent
-of this RFC is that the `futures` crate itself should provide a configurable,
-default global thread pool, which provides similar benefits to providing a
-global event loop. Exact details are out of scope for this RFC.
+The threadpool case is provided by crates like [futures_cpupool]; eventually, a
+crate along these lines should provide a configurable, default global thread
+pool, which provides similar benefits to providing a global event loop. This
+functionality may eventually want to live in the `futures` crate. Exact details
+are out of scope for this RFC.
 
 [futures_cpupool]: https://docs.rs/futures-cpupool/0.1.5/futures_cpupool/
 
@@ -685,54 +709,24 @@ The `futures` crate will add a module, `current_thread`, with the following
 contents:
 
 ```rust
-pub mod current_thread {
+pub mod thread {
     // Execute the given future *synchronously* on the current thread, blocking until
     // it completes and returning its result.
     //
     // NB: no 'static requirement on the future
     pub fn block_until<F: Future>(f: F) -> Result<F::Item, F::Error>;
 
-    // A convenience function that creates a new task runner, invokes the given
-    // closure with a handle to it, then executes all spawned tasks to completion.
-    pub fn block_on_all<F>(f: F) where F: FnOnce(&Spawner);
+    // Blocks until either all non-daemon tasks complete, or `force_shutdown` is invoked
+    pub fn block_on_all<F>(f: F) where F: FnOnce(KillSwitch, &Spawner);
 
-    // An object for cooperatively executing multiple tasks on a single thread.
-    // Useful for working with non-`Send` futures.
+    // A handle for forcibly shutting down all running tasks.
     //
     // NB: this is not `Send`
-    pub struct TaskRunner { .. }
+    pub struct KillSwitch { .. }
 
-    impl TaskRunner {
-        pub fn new() -> Self;
-
-        // To spawn tasks onto this runner, you need a separate, cloneable
-        // `Spawner` object.
-        pub fn spawner(&self) -> Spawner;
-
-        // Blocks, running all *non-daemon* tasks to completion.
-        pub fn block_on_all(&self);
-
-        // Blocks, pushing all tasks forward but returning when the given future
-        // completes.
-        //
-        // NB: no 'static requirement on the future
-        pub fn block_until<F: Future>(&mut self, f: F) -> Result<F::Item, F::Error>;
-
-        // Kills off *all* remaining tasks (daemon or not)
-        pub fn force_shutdown(self);
-    }
-
-    impl Drop for TaskRunner {
-        // panics if:
-        //   (1) not already panicking and
-        //   (2) there are non-daemon tasks remaining
-    }
-
-    impl Futue for TaskRunner {
-        type Item = ();
-        type Error = ();
-
-        // polls *all* current tasks
+    impl KillSwitch {
+        // Cancels off *all* remaining tasks (daemon or not)
+        pub fn cancel_all(self);
     }
 
     // NB: this is not `Send`
@@ -766,15 +760,19 @@ This suite of functionality replaces two APIs provided in the Tokio stack today:
   of other ecosystems like Finagle in Scala, having a blocking method so easily
   within reach on futures leads people down the wrong path. While it's vitally
   important to have this "bridge" between the async and sync worlds, providing
-  it as `current_thread::block_until` makes it much more clear what is involved.
+  it as `thread::block_until` makes it much more clear what is involved.
 
-- The `TaskRunner` and `Spawner` types replace the use of `Handle` today for
+- The `KillSwitch` and `Spawner` types replace the use of `Handle` today for
   cooperative, non-`Send` task execution. Unlike `Handle`, though, this API is
   carefully crafted to help ensure that spawned tasks are actually run to
   completion, unless explicitly requested otherwise.
 
 Thus, in addition to providing a cleaner factoring, these two APIs also mitigate
 two major footguns with today's Tokio stack.
+
+Those wishing to couple a reactor and a single-threaded executor, as today's
+`tokio-core` does, should use `FuturesUnordered` together with a custom reactor
+to do so.
 
 ### Executors in general
 
@@ -804,6 +802,33 @@ i.e. that block until some future completes (or other event
 occurs). Consequently, nested uses of `TaskRunner`, or usage of
 `current_thread::block_until` within a `TaskRunner` or thread pool, will panic,
 alerting the user to a bug.
+
+## The `futures-timer` crate
+
+The `futures-timer` crate will contain the `Timeout` and `Interval` types
+currently in `tokio_core`'s `reactor` module:
+
+```rust
+impl Timeout {
+    fn new(dur: Duration) -> Result<Timeout>
+    fn new_at(at: Instant) -> Result<Timeout>
+    fn reset(&mut self, at: Instant);
+}
+
+impl Future for Timeout { .. }
+
+impl Interval {
+    fn new(dur: Duration) -> Result<Interval>
+    fn new_at(at: Instant, dur: Duration) -> Result<Interval>
+    fn reset(&mut self, at: Instant);
+}
+
+impl Stream for Interval { .. }
+```
+
+These functions will lazily initialize a dedicated timer thread. We will eventually
+provide a means of customization, similar to `SetDefault` for reactor, but that's
+out of scope for this RFC.
 
 ## Migration Guide
 
@@ -920,15 +945,6 @@ they might otherwise be.
 
 The rationale has been discussed pretty extensively throughout. However, a few
 aspects of the design have quite plausible alternatives:
-
-- The `current_thread` module goes to some length to avoid footguns, at the
-  costs of API complexity and ergonomics. We could instead forgo the use of an
-  RAII-style API, instead using thread-local storage to allow tasks to be
-  spawned at any time, without any assurance that they will actually be run.
-  - Ultimately, the use of `current_thread` for task spawning is expected to be
-    limited to the "outer layer" of most apps, i.e. to spawning tasks for
-    handling incoming connections. Therefore, the ergonomic concerns do not seem
-    *so* concerning, relative to the benefits of footgun protection.
 
 - The approach to `Handle`s means that libraries need to provide *two* API
   surfaces: one using the default global reactor, and one allowing for
