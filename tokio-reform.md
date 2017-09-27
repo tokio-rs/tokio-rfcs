@@ -290,7 +290,7 @@ fn main() {
         .parse()
         .unwrap();
 
-    current_thread::block_on_all(|spawner| {
+    current_thread::block_on_all(|_, spawner| {
         spawner.spawn(serve(spawner, addr));
     });
 }
@@ -355,7 +355,7 @@ fn main() {
         .parse()
         .unwrap();
 
-    current_thread::block_on_all(|spawner| {
+    current_thread::block_on_all(|_, spawner| {
         spawner.spawn(serve(spawner, addr));
     });
 }
@@ -731,7 +731,7 @@ pub mod thread {
     pub fn block_until<F: Future>(f: F) -> Result<F::Item, F::Error>;
 
     // Blocks until either all non-daemon tasks complete, or `force_shutdown` is invoked
-    pub fn block_on_all<F>(f: F) where F: FnOnce(KillSwitch, &Spawner);
+    pub fn block_on_all<F>(f: F) where F: FnOnce(KillSwitch, Spawner);
 
     // A handle for forcibly shutting down all running tasks.
     //
