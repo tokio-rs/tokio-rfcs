@@ -256,12 +256,12 @@ use std::env;
 use std::net::SocketAddr;
 
 use futures::{Future, Stream, IntoFuture};
-use futures::current_thread::{self, Spawner};
+use futures::thread::{self, Controller};
 use tokio_core::net::TcpListener;
 use tokio_io::AsyncRead;
 use tokio_io::io::copy;
 
-fn serve(spawner: &Spawner, addr: SocketAddr) -> impl Future<Item = (), Error = io::Error> {
+fn serve(cont: &Controller, addr: SocketAddr) -> impl Future<Item = (), Error = io::Error> {
     TcpListener::bind(&addr)
         .into_future()
         .and_then(move |socket| {
@@ -271,7 +271,7 @@ fn serve(spawner: &Spawner, addr: SocketAddr) -> impl Future<Item = (), Error = 
                 .incoming()
                 .for_each(move |(conn, _)| {
                     let (reader, writer) = conn.split();
-                    spawner.spawn(copy(reader, writer).then(move |result| {
+                    cont.spawn(copy(reader, writer).then(move |result| {
                         match result {
                             Ok((amt, _, _)) => println!("wrote {} bytes to {}", amt, addr),
                             Err(e) => println!("error on {}: {}", addr, e),
@@ -290,15 +290,15 @@ fn main() {
         .parse()
         .unwrap();
 
-    current_thread::block_on_all(|_, spawner| {
-        spawner.spawn(serve(spawner, addr));
+    thread::block_on_all(|cont| {
+        cont.spawn(serve(&cont, addr));
     });
 }
 ```
 
 This version of the code retains the move to using futures explicitly, but
 eliminates the explicit event loop setup and handle passing. To execute and
-spawn tasks, it uses the `current_thread` executor from futures, which
+spawn tasks, it uses the `thread` executor from futures, which
 multiplexes tasks onto the current OS thread. A similar API is available for
 working with the default thread pool instead, which is more appropriate for
 tasks performing blocking or CPU-heavy work.
@@ -320,13 +320,13 @@ use std::env;
 use std::net::SocketAddr;
 
 use futures::prelude::*;
-use futures::current_thread::{self, Spawner};
+use futures::thread::{self, Controller};
 use tokio::net::TcpListener;
 use tokio_io::AsyncRead;
 use tokio_io::io::copy;
 
 #[async]
-fn serve(spawner: &Spawner, addr: SocketAddr) -> io::Result<()> {
+fn serve(cont: &Controller, addr: SocketAddr) -> io::Result<()> {
     let socket = TcpListener::bind(&addr)?;
     println!("Listening on: {}", addr);
 
@@ -335,7 +335,7 @@ fn serve(spawner: &Spawner, addr: SocketAddr) -> io::Result<()> {
         // with Tokio, read and write components are distinct:
         let (reader, writer) = conn.split();
 
-        spawner.spawn(async_block! {
+        cont.spawn(async_block! {
             match await!(copy(reader, writer)) {
                 Ok((amt, _, _)) => println!("wrote {} bytes to {}", amt, addr),
                 Err(e) => println!("error on {}: {}", addr, e),
@@ -355,8 +355,8 @@ fn main() {
         .parse()
         .unwrap();
 
-    current_thread::block_on_all(|_, spawner| {
-        spawner.spawn(serve(spawner, addr));
+    thread::block_on_all(|cont| {
+        cont.spawn(serve(&cont, addr));
     });
 }
 ```
@@ -378,7 +378,7 @@ The *long-term* goal is to provide a complete async story that feels very close 
 synchronous programming, i.e. something like:
 
 ```rust
-async fn serve(spawner: &Spawner,addr: SocketAddr) -> io::Result<()> {
+async fn serve(cont: &Controller, addr: SocketAddr) -> io::Result<()> {
     let socket = TcpListener::bind(&addr)?;
     println!("Listening on: {}", addr);
 
@@ -386,7 +386,7 @@ async fn serve(spawner: &Spawner,addr: SocketAddr) -> io::Result<()> {
         // with Tokio, read and write components are distinct:
         let (reader, writer) = conn.split();
 
-        spawner.spawn(async {
+        cont.spawn(async {
             match await copy(reader, writer) {
                 Ok((amt, _, _)) => println!("wrote {} bytes to {}", amt, addr),
                 Err(e) => println!("error on {}: {}", addr, e),
@@ -554,25 +554,22 @@ event loops):
 - `Reactor`, an owned reactor. (Used to be `Core`)
 - `Handle`, a shared, cloneable handle to a reactor.
 - `PollEvented`, a bridge between `mio` event sources and a reactor
-- `SetDefault`, an RAII object for overriding the default reactor.
 
 Compared to `Core` today, the `Reactor` API is much the same, but drops the
 `run` and `remote` methods and the `Executor` implementation:
 
 ```rust
-impl<'a> From<&'a Reactor> for NotifyHandle { /* ... */ }
-
 impl Reactor {
-    fn new() -> Result<Reactor>;
-    fn handle(&self) -> Handle;
+    pub fn new() -> Result<Reactor>;
+    pub fn handle(&self) -> Handle;
 
     // blocks, turning the event loop until either woken through a handle,
     // or the given timeout expires.
-    fn turn(&mut self, max_wait: Option<Duration>) -> Turn;
+    pub fn turn(&mut self, max_wait: Option<Duration>) -> Turn;
 }
 
 // No contents/API initially, but we may want to expand this in the future
-struct Turn { /* ... */ }
+pub struct Turn { /* ... */ }
 ```
 
 The `Handle` API is also slimmed down:
@@ -583,8 +580,16 @@ impl Default for Handle {
 }
 
 impl Handle {
-    // wakes up the corresponding reactor if it is blocking
-    fn wakeup(&self);
+    // Wakes up the corresponding reactor if it is blocking
+    pub fn wakeup(&self);
+
+    // Sets this handle as the default (returned by `Handle::default`)
+    // within the current thread, for the duration of `Enter`'s lifetime.
+    //
+    // The `Enter` type is explained in a later section on executors,
+    // but the point here is that defaults are tied to executor
+    // granularity.
+    pub fn make_default_for(&self, &mut Enter);
 }
 ```
 
@@ -595,60 +600,6 @@ Unlike today, though, `Handle` is `Send` and `Sync` (as well as `Clone`).
 Handles are used solely to tie particular I/O objects to particular event loops.
 In particular, the `PollEvented` API stays exactly as-is, and is the primitive
 way that I/O objects are registered onto a reactor.
-
-Finally, we have an API for customizing the default reactor handle:
-
-```rust
-struct SetDefault<'a> {
-    handle: &'a Handle,
-    _marker: marker::PhantomData<Rc<()>>, // no sharing to other threads
-}
-
-impl<'a> SetDefault<'a> {
-    // Changes the return value of `Handle::default()` to return a
-    // clone of the `handle` provided.
-    //
-    // This function is used to change the default global event loop
-    // as identified through `Handle::default()`. The new default applies to
-    // the *current OS thread* only; as long as the returned object is live,
-    // the thread will return a clone of the given `Handle` on calls to
-    // `Handle::default()`. This, in particular, prevents the `Handle::default()`
-    // from spinning up a lazily-initialized thread.
-    //
-    // When the returned object goes out of scope then the return value of
-    // `Handle::default()` will revert to the (lazily-initialized) default
-    // event loop.
-    //
-    // This function is intended to be used within *applications* at executor
-    // granularity; it is not intended as a general-purpose mechanism to eschew
-    // passing a `Handle` for library APIs. This function can only be called
-    // *once* recursively on a thread: reentrant uses will panic.
-    //
-    // # Panics
-    //
-    // This function will panic if there's another `SetDefault` object already
-    // active for this thread. In other words, calling this function a second
-    // time on one thread where the first return value is alive will cause a panic.
-    pub fn new(handle: &'a Handle) -> SetDefault<'a> {
-        // panic if tls is `Some`
-        // set scoped tls to `Some(handle)`
-        SetDefault {
-            handle
-            _marker: marker::PhantomData,
-        }
-    }
-
-    // Keeps this new default handle installed for the duration of the thread's
-    // execution.
-    fn make_permanent(self);
-}
-
-impl<'a> Drop for SetDefault<'a> {
-    fn drop(&mut self) {
-        // set scoped tls to `None`
-    }
-}
-```
 
 ### The `net` module
 
@@ -731,25 +682,17 @@ pub mod thread {
     pub fn block_until<F: Future>(f: F) -> Result<F::Item, F::Error>;
 
     // Blocks until either all non-daemon tasks complete, or `force_shutdown` is invoked
-    pub fn block_on_all<F>(f: F) where F: FnOnce(KillSwitch, Spawner);
+    pub fn block_on_all<F>(f: F) where F: FnOnce(Controller);
 
-    // A handle for forcibly shutting down all running tasks.
+    // A handle used for controlling task spawning and execution within `block_on_all`
     //
     // NB: this is not `Send`
-    pub struct KillSwitch { .. }
-
-    impl KillSwitch {
-        // Cancels off *all* remaining tasks (daemon or not)
-        pub fn cancel_all(self);
-    }
-
-    // NB: this is not `Send`
     #[derive(Clone)]
-    pub struct Spawner { .. }
+    pub struct Controller { .. }
 
-    impl Spawner {
+    impl Controller {
         // Spawns a "standard" task, i.e. one that must be explicitly either
-        // blocked on or killed off before the associated `TaskRunner` is destroyed.
+        // blocked on or killed off before `block_on_all` will return.
         pub fn spawn<F>(&self, task: F)
             where F: Future<Item = (), Error = ()> + 'static;
 
@@ -757,9 +700,15 @@ pub mod thread {
         // for completion.
         pub fn spawn_daemon<F>(&self, task: F)
             where F: Future<Item = (), Error = ()> + 'static;
+
+        // Cancels off *all* remaining tasks (daemon or not)
+        pub fn cancel_all(&self);
+
+        // Extract proof that we're in an executor context (see below)
+        pub fn enter(&self) -> &Enter;
     }
 
-    impl<F> Executor<F> for Spawner
+    impl<F> Executor<F> for Controller
         where F: Future<Item = (), Error = ()> + 'static
     {
         // ...
@@ -792,7 +741,7 @@ to do so.
 
 Another footgun we want to watch out for is accidentally trying to spin up
 multiple executors on a single thread. The most common case is using
-`current_thread::block_until` on, say, a thread pool's worker thread.
+`thread::block_until` on, say, a thread pool's worker thread.
 
 We can mitigate this easily by providing an API for "executor binding" that
 amounts to a thread-local boolean:
@@ -805,6 +754,19 @@ pub mod executor {
     // an executor. Panics if the current thread is *already* marked.
     pub fn enter() -> Enter;
 
+    impl Enter {
+        // Register a callback to be invoked if and when the thread
+        // ceased to act as an executor.
+        pub fn on_exit<F>(&mut self, f: F) where F: FnOnce();
+
+        // Treat the remainder of execution on this thread as part of an
+        // executor; used mostly for thread pool worker threads.
+        //
+        // All registered `on_exit` callbacks are *dropped* without being
+        // invoked.
+        pub fn make_permanent(self);
+    }
+
     impl Drop for Enter {
         // Exits the dynamic extent of an executor, unbinding the thread
     }
@@ -813,9 +775,15 @@ pub mod executor {
 
 This API should be used in functions like `block_until` that enter executors,
 i.e. that block until some future completes (or other event
-occurs). Consequently, nested uses of `TaskRunner`, or usage of
-`current_thread::block_until` within a `TaskRunner` or thread pool, will panic,
-alerting the user to a bug.
+occurs). Consequently, nested uses of `block_until`, or uses within a thread
+pool, will panic, alerting the user to a bug.
+
+Executors should publicly expose access to an `Enter` only during
+initialization, e.g. many executors provide for "initialization hooks" for
+setting up worker threads, and these hooks and provide temporary access to an
+`Enter`. That restriction is leveraged by methods like
+`Handle::make_default_for`, which are intended to only be used during executor
+thread initialization.
 
 ## The `futures-timer` crate
 
@@ -853,7 +821,7 @@ version bump:
 
 - Uses of `Remote`/`Handle` that don't involve spawning threads can use the new
   `Handle`.
-- Local task spawning should migrate to use the `current_thread` module.
+- Local task spawning should migrate to use the `thread` module.
 - APIs that need to construct I/O objects, or otherwise require a `Handle`,
   should follow the pattern laid out in the `net` module:
   - There should be a simple standard API that does not take an explicit
@@ -873,29 +841,21 @@ the new `tokio` crate, with the ability to dig into this layering. This
 reimplementation will be provided as a new, semver-compatible release.
 
 The key idea is that a `tokio_core` `Core` is a *combination* of a `Reactor` and
-`TaskRunner` in this RFC. Likewise, a `tokio_core` `Handle` is a combo of a
-`tokio` `Handle` and a `Spawner`. In particular:
+a custom thread-local executor, and you can thus extract out the underlying pieces:
 
 ```rust
 // in the new tokio_core release:
 
 use tokio::reactor;
-use futures::current_thread;
+use futures::thread;
 
 impl Core {
-    fn from_tokio(
-        reactor: reactor::Reactor,
-        runner: current_thread::TaskRunner
-    ) -> Self;
-
+    fn from_tokio_reactor(reactor: reactor::Reactor) -> Self;
     fn tokio_reactor(&mut self) -> &mut reactor::Reactor;
-    fn task_runner(&mut self) -> &mut current_thread::TaskRunner;
-    fn force_shutdown(self);
 }
 
 impl Handle {
     fn tokio_handle(&self) -> &reactor::Handle;
-    fn spawner(&self) -> &current_thread::Spawner;
 }
 ```
 
@@ -905,7 +865,7 @@ the current `tokio_core` libraries and those that have migrated to `tokio`.
 ### `tokio-io`
 
 The `tokio-io` crate needs an overall API audit. Its APIs may eventually be
-*re*exported within the `tokio` crate, but it also has value as a standalone
+reexported within the `tokio` crate, but it also has value as a standalone
 crate that provides general I/O utilities for futures. (It may move into
 `futures` instead).
 
