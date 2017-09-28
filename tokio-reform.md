@@ -787,17 +787,17 @@ thread initialization.
 
 ## The `futures-timer` crate
 
-The `futures-timer` crate will contain the `Timeout` and `Interval` types
+The `futures-timer` crate will contain the `Delay` (used to be `Timeout`) and `Interval` types
 currently in `tokio_core`'s `reactor` module:
 
 ```rust
-impl Timeout {
-    fn new(dur: Duration) -> Result<Timeout>
-    fn new_at(at: Instant) -> Result<Timeout>
+impl Delay {
+    fn new(dur: Duration) -> Result<Delay>
+    fn new_at(at: Instant) -> Result<Delay>
     fn reset(&mut self, at: Instant);
 }
 
-impl Future for Timeout { .. }
+impl Future for Delay { .. }
 
 impl Interval {
     fn new(dur: Duration) -> Result<Interval>
