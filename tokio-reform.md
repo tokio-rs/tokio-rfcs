@@ -725,10 +725,10 @@ This suite of functionality replaces two APIs provided in the Tokio stack today:
   important to have this "bridge" between the async and sync worlds, providing
   it as `thread::block_until` makes it much more clear what is involved.
 
-- The `KillSwitch` and `Spawner` types replace the use of `Handle` today for
-  cooperative, non-`Send` task execution. Unlike `Handle`, though, this API is
-  carefully crafted to help ensure that spawned tasks are actually run to
-  completion, unless explicitly requested otherwise.
+- The `Controller` type replaces the use of `Handle` today for cooperative,
+  non-`Send` task execution. Unlike `Handle`, though, this API is carefully
+  crafted to help ensure that spawned tasks are actually run to completion,
+  unless explicitly requested otherwise.
 
 Thus, in addition to providing a cleaner factoring, these two APIs also mitigate
 two major footguns with today's Tokio stack.
