@@ -256,12 +256,12 @@ use std::env;
 use std::net::SocketAddr;
 
 use futures::{Future, Stream, IntoFuture};
-use futures::thread::{self, Controller};
+use futures::thread;
 use tokio_core::net::TcpListener;
 use tokio_io::AsyncRead;
 use tokio_io::io::copy;
 
-fn serve(cont: &Controller, addr: SocketAddr) -> impl Future<Item = (), Error = io::Error> {
+fn serve(addr: SocketAddr) -> impl Future<Item = (), Error = io::Error> {
     TcpListener::bind(&addr)
         .into_future()
         .and_then(move |socket| {
@@ -271,7 +271,7 @@ fn serve(cont: &Controller, addr: SocketAddr) -> impl Future<Item = (), Error = 
                 .incoming()
                 .for_each(move |(conn, _)| {
                     let (reader, writer) = conn.split();
-                    cont.spawn(copy(reader, writer).then(move |result| {
+                    thread::spawn_task(copy(reader, writer).then(move |result| {
                         match result {
                             Ok((amt, _, _)) => println!("wrote {} bytes to {}", amt, addr),
                             Err(e) => println!("error on {}: {}", addr, e),
@@ -290,9 +290,7 @@ fn main() {
         .parse()
         .unwrap();
 
-    thread::block_on_all(|cont| {
-        cont.spawn(serve(&cont, addr));
-    });
+    thread::block_on_all(serve(addr));
 }
 ```
 
@@ -320,13 +318,13 @@ use std::env;
 use std::net::SocketAddr;
 
 use futures::prelude::*;
-use futures::thread::{self, Controller};
+use futures::thread;
 use tokio::net::TcpListener;
 use tokio_io::AsyncRead;
 use tokio_io::io::copy;
 
 #[async]
-fn serve(cont: &Controller, addr: SocketAddr) -> io::Result<()> {
+fn serve(addr: SocketAddr) -> io::Result<()> {
     let socket = TcpListener::bind(&addr)?;
     println!("Listening on: {}", addr);
 
@@ -335,16 +333,14 @@ fn serve(cont: &Controller, addr: SocketAddr) -> io::Result<()> {
         // with Tokio, read and write components are distinct:
         let (reader, writer) = conn.split();
 
-        cont.spawn(async_block! {
+        thread::spawn_task(async_block! {
             match await!(copy(reader, writer)) {
                 Ok((amt, _, _)) => println!("wrote {} bytes to {}", amt, addr),
                 Err(e) => println!("error on {}: {}", addr, e),
             };
-
             Ok(())
         });
     }
-
     Ok(())
 }
 
@@ -355,9 +351,7 @@ fn main() {
         .parse()
         .unwrap();
 
-    thread::block_on_all(|cont| {
-        cont.spawn(serve(&cont, addr));
-    });
+    thread::block_on_all(serve(&cont, addr));
 }
 ```
 
@@ -378,7 +372,7 @@ The *long-term* goal is to provide a complete async story that feels very close 
 synchronous programming, i.e. something like:
 
 ```rust
-async fn serve(cont: &Controller, addr: SocketAddr) -> io::Result<()> {
+async fn serve(addr: SocketAddr) -> io::Result<()> {
     let socket = TcpListener::bind(&addr)?;
     println!("Listening on: {}", addr);
 
@@ -386,12 +380,11 @@ async fn serve(cont: &Controller, addr: SocketAddr) -> io::Result<()> {
         // with Tokio, read and write components are distinct:
         let (reader, writer) = conn.split();
 
-        cont.spawn(async {
+        thread::spawn_task(async {
             match await copy(reader, writer) {
                 Ok((amt, _, _)) => println!("wrote {} bytes to {}", amt, addr),
                 Err(e) => println!("error on {}: {}", addr, e),
             };
-
             Ok(())
         });
     }
@@ -675,73 +668,106 @@ contents:
 
 ```rust
 pub mod thread {
-    // Execute the given future *synchronously* on the current thread, blocking until
-    // it completes and returning its result.
-    //
-    // NB: no 'static requirement on the future
-    pub fn block_until<F: Future>(f: F) -> Result<F::Item, F::Error>;
+    /// Execute the given future *synchronously* on the current thread, blocking until
+    /// it (and all spawned tasks) completes and returning its result.
+    ///
+    /// In more detail, this function blocks until:
+    /// - the given future completes, *and*
+    /// - all spawned tasks complete, or `cancel_all_spawned` is invoked
+    ///
+    /// Note that there is no `'static` or `Send` requirement on the future.
+    pub fn block_on_all<F: Future>(f: F)  -> Result<F::Item, F::Error>;
 
-    // Blocks until either all non-daemon tasks complete, or `force_shutdown` is invoked
-    pub fn block_on_all<F>(f: F) where F: FnOnce(Controller);
+    /// Execute the given closure, then block until all spawned tasks complete.
+    ///
+    /// In more detail, this function will block until:
+    /// - All spawned tasks are complete, or
+    /// - `cancel_all_spawned` is invoked.
+    pub fn block_with_init<F>(f: F) where F: FnOnce(&Enter);
 
-    // A handle used for controlling task spawning and execution within `block_on_all`
-    //
-    // NB: this is not `Send`
-    #[derive(Clone)]
-    pub struct Controller { .. }
+    /// Spawns a task, i.e. one that must be explicitly either
+    /// blocked on or killed off before `block_*` will return.
+    ///
+    /// # Panics
+    ///
+    /// This function can only be invoked within a future given to a `block_*`
+    /// invocation; any other use will result in a panic.
+    pub fn spawn_task<F>(task: F) where F: Future<Item = (), Error = ()> + 'static;
 
-    impl Controller {
-        // Spawns a "standard" task, i.e. one that must be explicitly either
-        // blocked on or killed off before `block_on_all` will return.
-        pub fn spawn<F>(&self, task: F)
-            where F: Future<Item = (), Error = ()> + 'static;
+    /// Spawns a daemon, which does *not* block the pending `block_on_all` call.
+    ///
+    /// # Panics
+    ///
+    /// This function can only be invoked within a future given to a `block_*`
+    /// invocation; any other use will result in a panic.
+    pub fn spawn_daemon<F>(task: F) where F: Future<Item = (), Error = ()> + 'static;
 
-        // Spawns a "daemon" task, which is not blocked on when waiting
-        // for completion.
-        pub fn spawn_daemon<F>(&self, task: F)
-            where F: Future<Item = (), Error = ()> + 'static;
+    /// Cancels *all* spawned tasks and daemons.
+    ///
+    /// # Panics
+    ///
+    /// This function can only be invoked within a future given to a `block_*`
+    /// invocation; any other use will result in a panic.
+    pub fn cancel_all_spawned(&self);
 
-        // Cancels off *all* remaining tasks (daemon or not)
-        pub fn cancel_all(&self);
+    struct TaskExecutor { .. }
+    impl<F> Executor<F> for TaskExecutor
+        where F: Future<Item = (), Error = ()> + 'static { .. }
 
-        // Extract proof that we're in an executor context (see below)
-        pub fn enter(&self) -> &Enter;
-    }
+    /// Provides an executor handle for spawning tasks onto the current thread.
+    ///
+    /// # Panics
+    ///
+    /// As with the `spawn_*` functions, this function can only be invoked within
+    /// a future given to a `block_*` invocation; any other use will result in
+    // a panic.
+    pub fn task_executor() -> TaskExecutor;
 
-    impl<F> Executor<F> for Controller
-        where F: Future<Item = (), Error = ()> + 'static
-    {
-        // ...
-    }
+    struct DaemonExecutor { .. }
+    impl<F> Executor<F> for DaemonExecutor
+        where F: Future<Item = (), Error = ()> + 'static { .. }
+
+    /// Provides an executor handle for spawning daemons onto the current thread.
+    ///
+    /// # Panics
+    ///
+    /// As with the `spawn_*` functions, this function can only be invoked within
+    /// a future given to a `block_*` invocation; any other use will result in
+    // a panic.
+    pub fn daemon_executor() -> TaskExecutor;
 }
 ```
 
 This suite of functionality replaces two APIs provided in the Tokio stack today:
 
-- The free `block_until` function replaces the `wait` method on `Future`, which
+- The free `block_on_all` function replaces the `wait` method on `Future`, which
   will be deprecated. In our experience with Tokio, as well as the experiences
   of other ecosystems like Finagle in Scala, having a blocking method so easily
   within reach on futures leads people down the wrong path. While it's vitally
   important to have this "bridge" between the async and sync worlds, providing
-  it as `thread::block_until` makes it much more clear what is involved.
+  it as `thread::block_on_all` highlights the synchronous nature. In addition,
+  the fact that the function automatically blocks on any spawned tasks helps
+  avoid footguns as well.
 
-- The `Controller` type replaces the use of `Handle` today for cooperative,
-  non-`Send` task execution. Unlike `Handle`, though, this API is carefully
-  crafted to help ensure that spawned tasks are actually run to completion,
-  unless explicitly requested otherwise.
-
-Thus, in addition to providing a cleaner factoring, these two APIs also mitigate
-two major footguns with today's Tokio stack.
+- Today, Tokio's `Handle` can be used for cooperative, non-`Send` task
+  execution. Here, that functionality is replaced (and enhanced) by a suite of
+  free functions, `spawn_task`, `spawn_daemon`, and `cancel_all_spawned`. These
+  functions, which can only be called in the context of a `block_*` function,
+  give you ways both to spawn cooperative tasks, and to fully manage
+  shutdown. In particular, the fact that `block_on_all` waits for spawned tasks
+  to complete (or for explicit cancellation) helps mitigate another footgun with
+  today's setup: tasks that are dropped on the floor.
 
 Those wishing to couple a reactor and a single-threaded executor, as today's
-`tokio-core` does, should use `FuturesUnordered` together with a custom reactor
-to do so.
+`tokio-core` does, should use something like `FuturesUnordered` together with a
+custom reactor to do so. We expect there will eventually be a separate crate
+providing this functionality in a high-performance way.
 
 ### Executors in general
 
 Another footgun we want to watch out for is accidentally trying to spin up
 multiple executors on a single thread. The most common case is using
-`thread::block_until` on, say, a thread pool's worker thread.
+`thread::block_on_all` on, say, a thread pool's worker thread.
 
 We can mitigate this easily by providing an API for "executor binding" that
 amounts to a thread-local boolean:
@@ -773,9 +799,9 @@ pub mod executor {
 }
 ```
 
-This API should be used in functions like `block_until` that enter executors,
+This API should be used in functions like `block_on_all` that enter executors,
 i.e. that block until some future completes (or other event
-occurs). Consequently, nested uses of `block_until`, or uses within a thread
+occurs). Consequently, nested uses of `block_on_all`, or uses within a thread
 pool, will panic, alerting the user to a bug.
 
 Executors should publicly expose access to an `Enter` only during
