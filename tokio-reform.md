@@ -610,11 +610,14 @@ impl TcpListener {
     fn bind(addr: &SocketAddr) -> io::Result<TcpListener>;
 
     // set up a fully-customized listener
-    fn from_listener(listener: std::net::TcpListener, handle: &Handle) -> io::Result<TcpListener>;
+    fn from_std(listener: std::net::TcpListener, handle: &Handle) -> io::Result<TcpListener>;
 
-    // this now yields a *std* TcpStream, so that you can use `TcpStream::from_stream` to
+    // this yields a *std* TcpStream, so that you can use `TcpStream::from_std` to
     // associate it with an handle of your choice.
-    fn accept(&mut self) -> Result<(std::net::TcpStream, SocketAddr)>
+    fn accept_std(&mut self) -> Result<(std::net::TcpStream, SocketAddr)>
+
+    // by contrast, this method returns a stream bound to the default handle.
+    fn accept(&mut self) -> Result<(TcpStream, SocketAddr)>
 }
 ```
 
@@ -626,8 +629,8 @@ impl TcpStream {
     fn connect(addr: &SocketAddr) -> TcpStreamNew;
 
     // these are as today
-    fn from_stream(stream: TcpStream, handle: &Handle) -> Result<TcpStream>;
-    fn connect_stream(stream: TcpStream, addr: &SocketAddr, handle: &Handle) -> TcpStreamNew
+    fn from_std(stream: std::net::TcpStream, handle: &Handle) -> Result<TcpStream>;
+    fn connect_std(stream: std::net::TcpStream, addr: &SocketAddr, handle: &Handle) -> TcpStreamNew
 }
 ```
 
@@ -783,7 +786,7 @@ pub mod executor {
     impl Enter {
         // Register a callback to be invoked if and when the thread
         // ceased to act as an executor.
-        pub fn on_exit<F>(&mut self, f: F) where F: FnOnce();
+        pub fn on_exit<F>(&self, f: F) where F: FnOnce() + 'static;
 
         // Treat the remainder of execution on this thread as part of an
         // executor; used mostly for thread pool worker threads.
@@ -845,7 +848,7 @@ expectation is that over time the ecosystem will converge on just using `tokio`.
 Transitioning APIs over is largely straightforward, but will require a major
 version bump:
 
-- Uses of `Remote`/`Handle` that don't involve spawning threads can use the new
+- Uses of `Remote`/`Handle` that don't involve spawning tasks can use the new
   `Handle`.
 - Local task spawning should migrate to use the `thread` module.
 - APIs that need to construct I/O objects, or otherwise require a `Handle`,
