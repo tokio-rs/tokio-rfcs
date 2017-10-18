@@ -737,7 +737,7 @@ pub mod thread {
     /// As with the `spawn_*` functions, this function can only be invoked within
     /// a future given to a `block_*` invocation; any other use will result in
     // a panic.
-    pub fn daemon_executor() -> TaskExecutor;
+    pub fn daemon_executor() -> DaemonExecutor;
 }
 ```
 
